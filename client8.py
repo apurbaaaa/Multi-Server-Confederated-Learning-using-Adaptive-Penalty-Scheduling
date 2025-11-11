@@ -9,22 +9,41 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, roc_auc_score
 from flwr.client import NumPyClient, ClientApp
+import traceback
+import sys
+import json
 
 # -------------------------
 # Data loader (per-client)
 # -------------------------
-def load_data(client_file="client8.csv", test_split_ratio=0.5):
-    df = pd.read_csv(client_file)
-    y = df["isFraud"].astype(int).values
-    X = df.drop(columns=["isFraud"])
+def load_data(client_file="client2.csv", test_split_ratio=0.5):
+    try:
+        df = pd.read_csv(client_file, engine="python", on_bad_lines="skip")
+    except TypeError:
+        df = pd.read_csv(client_file, engine="python")
+
+    if "isFraud" in df.columns:
+        label_col = "isFraud"
+    elif "Default" in df.columns:
+        label_col = "Default"
+    else:
+        raise ValueError(f"Label column not found in {client_file}; expected 'isFraud' or 'Default'")
+
+    df = df.dropna(subset=[label_col])
+    df[df.select_dtypes(include=[np.number]).columns] = df.select_dtypes(include=[np.number]).fillna(df.select_dtypes(include=[np.number]).mean())
+
+    y = df[label_col].astype(int).values
+    X = df.drop(columns=[label_col])
+
+    from sklearn.model_selection import train_test_split
+    stratify = y if len(np.unique(y)) > 1 else None
+    X_train, X_test, y_train, y_test = train_test_split(
+        X.values.astype("float32"), y.astype("float32"), test_size=test_split_ratio, random_state=42, stratify=stratify
+    )
 
     scaler = StandardScaler()
-    X = scaler.fit_transform(X).astype("float32")
-    y = y.astype("float32")
-
-    split_idx = int(test_split_ratio * len(X))
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
+    X_train = scaler.fit_transform(X_train).astype("float32")
+    X_test = scaler.transform(X_test).astype("float32")
 
     X_train = torch.tensor(X_train, dtype=torch.float32)
     y_train = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
@@ -79,7 +98,13 @@ def flatten_params_list(params_list):
     """Concatenate a list of numpy arrays into a 1D numpy array (float32)."""
     if params_list is None:
         return np.array([], dtype=np.float32)
-    flat = np.concatenate([p.ravel().astype(np.float32) for p in params_list])
+    arrs = []
+    for p in params_list:
+        a = np.asarray(p, dtype=np.float32)
+        arrs.append(a.ravel())
+    if len(arrs) == 0:
+        return np.array([], dtype=np.float32)
+    flat = np.concatenate(arrs).astype(np.float32)
     return flat
 
 def flatten_state_dict_parameters(model):
@@ -145,9 +170,9 @@ def test_model(model, testloader, device="cpu"):
             labels = labels.to(device)
             logits = model(inputs)
             loss = criterion(logits, labels).item()
-            probs = torch.sigmoid(logits).cpu().numpy()
-            preds = (probs > 0.5).astype(np.float32)
-            y_true = labels.cpu().numpy()
+            probs = torch.sigmoid(logits).squeeze().cpu().numpy()
+            preds = (probs > 0.5).astype(np.int64)
+            y_true = labels.squeeze().cpu().numpy().astype(np.int64)
 
             # safe metrics
             try:
@@ -155,7 +180,10 @@ def test_model(model, testloader, device="cpu"):
             except Exception:
                 acc = 0.0
             try:
-                auc = roc_auc_score(y_true, probs)
+                if len(np.unique(y_true)) == 2:
+                    auc = roc_auc_score(y_true, probs)
+                else:
+                    auc = 0.0
             except Exception:
                 auc = 0.0
 
@@ -192,78 +220,107 @@ class FlowerADMMClient(NumPyClient):
 
     def fit(self, parameters, config):
         """
-        parameters: list of numpy arrays (server-sent model init) - optional
-        config: dict that should contain 'y' (list), 'lambda' (list), 'sigma1', 'local_epochs', optional 'lr','batch_size'
+        Robust wrapper: catch exceptions, log full traceback, and always return a valid response.
         """
-        # If server passed a model in 'parameters', set it
-        if parameters is not None:
+        try:
+            # --- existing body of fit ---
+            if parameters is not None:
+                try:
+                    self.set_parameters(parameters)
+                except Exception as e:
+                    print("[Client] Warning: cannot load server parameters:", e, file=sys.stderr)
+
+            sigma1 = float(config.get("sigma1", 1.0))
+            local_epochs = int(config.get("local_epochs", 1))
+            lr = float(config.get("lr", 1e-4))
+            batch_size = int(config.get("batch_size", 64))
+
+            lambda_raw = config.get("lambda", None)
+            lambda_list = None
+            if isinstance(lambda_raw, str) and lambda_raw:
+                try:
+                    lambda_list = json.loads(lambda_raw)
+                except Exception:
+                    print("[Client] Warning: failed to parse lambda JSON from config", file=sys.stderr)
+                    lambda_list = None
+            else:
+                lambda_list = lambda_raw
+
+            if lambda_list is None:
+                print("[Client] Warning: 'lambda' not found in config. Running plain local training.", file=sys.stderr)
+                train_with_proximal(self.net, self.trainloader, prox_target_flat=np.zeros(0), sigma1=0.0, epochs=local_epochs, lr=lr, device=self.device)
+            else:
+                try:
+                    y_flat = flatten_state_dict_parameters(self.net).cpu().numpy().astype(np.float32)
+                except Exception:
+                    y_list = config.get("y", None)
+                    y_flat = flatten_params_list(y_list)
+
+                lambda_flat = flatten_params_list(lambda_list)
+
+                if y_flat.shape[0] != lambda_flat.shape[0]:
+                    raise ValueError("Server-sent y and lambda flattened lengths do not match")
+
+                prox_target = y_flat.astype(np.float32) + (lambda_flat.astype(np.float32) / float(sigma1))
+
+                if batch_size != self.trainloader.batch_size:
+                    self.trainloader = DataLoader(self.trainloader.dataset, batch_size=batch_size, shuffle=True)
+
+                train_with_proximal(self.net, self.trainloader, prox_target_flat=prox_target, sigma1=sigma1, epochs=local_epochs, lr=lr, device=self.device)
+
+            # successful return
+            return state_dict_to_params_list(self.net.state_dict()), len(self.trainloader.dataset), {}
+
+        except Exception as exc:
+            # Log full traceback for debugging
+            print("[Client ERROR] exception during fit:", file=sys.stderr)
+            traceback.print_exc()
+            # Return current parameters so server has something to aggregate
             try:
-                self.set_parameters(parameters)
-            except Exception as e:
-                # if shape mismatch, continue with client's current parameters
-                print("[Client] Warning: cannot load server parameters:", e)
+                fallback_params = state_dict_to_params_list(self.net.state_dict())
+                fallback_examples = len(self.trainloader.dataset)
+            except Exception:
+                fallback_params = []
+                fallback_examples = 0
+            return fallback_params, fallback_examples, {}
 
-        # parse config
-        # config may come as dictionary of strings (Flower sometimes serializes); handle robustly
-        sigma1 = float(config.get("sigma1", 1.0))
-        local_epochs = int(config.get("local_epochs", 1))
-        lr = float(config.get("lr", 1e-4))
-        # optional override for batch size
-        batch_size = int(config.get("batch_size", 64))
-
-        # get y and lambda from config
-        y_list = config.get("y", None)
-        lambda_list = config.get("lambda", None)
-
-        if y_list is None or lambda_list is None:
-            # Nothing to do ADMM-wise; run plain training for compatibility
-            print("[Client] Warning: 'y' or 'lambda' not found in config. Running plain local training.")
-            train_with_proximal(self.net, self.trainloader, prox_target_flat=np.zeros(0), sigma1=0.0, epochs=local_epochs, lr=lr, device=self.device)
-        else:
-            # flatten y and lambda lists in the same ordering as model.state_dict
-            y_flat = flatten_params_list(y_list)
-            lambda_flat = flatten_params_list(lambda_list)
-
-            if y_flat.shape[0] != lambda_flat.shape[0]:
-                raise ValueError("Server-sent y and lambda flattened lengths do not match")
-
-            # construct prox_target = y + lambda / sigma1
-            prox_target = y_flat.astype(np.float32) + (lambda_flat.astype(np.float32) / float(sigma1))
-
-            # call training with proximal term
-            # optionally override trainloader batch_size
-            if batch_size != self.trainloader.batch_size:
-                self.trainloader = DataLoader(self.trainloader.dataset, batch_size=batch_size, shuffle=True)
-
-            train_with_proximal(self.net, self.trainloader, prox_target_flat=prox_target, sigma1=sigma1, epochs=local_epochs, lr=lr, device=self.device)
-
-        # after training return parameters as list
-        return state_dict_to_params_list(self.net.state_dict()), len(self.trainloader.dataset), {}
 
     def evaluate(self, parameters, config):
-        # set model from server parameters if provided
-        if parameters is not None:
+        """
+        Robust evaluate wrapper. Logs exceptions and returns safe defaults.
+        """
+        try:
+            if parameters is not None:
+                try:
+                    self.set_parameters(parameters)
+                except Exception as e:
+                    print("[Client] Warning: eval cannot set params:", e, file=sys.stderr)
+
+            loss, acc, auc = test_model(self.net, self.testloader, device=self.device)
+            print(f"[Client Eval] Loss: {loss:.6f}, Acc: {acc:.4f}, AUC: {auc:.4f}")
+            return float(loss), len(self.testloader.dataset), {"accuracy": float(acc), "auc": float(auc)}
+        except Exception:
+            print("[Client ERROR] exception during evaluate:", file=sys.stderr)
+            traceback.print_exc()
+            # safe fallback
             try:
-                self.set_parameters(parameters)
-            except Exception as e:
-                print("[Client] Warning: eval cannot set params:", e)
-
-        loss, acc, auc = test_model(self.net, self.testloader, device=self.device)
-        print(f"[Client Eval] Loss: {loss:.6f}, Acc: {acc:.4f}, AUC: {auc:.4f}")
-        return float(loss), len(self.testloader.dataset), {"accuracy": float(acc), "auc": float(auc)}
-
-# -------------------------
+                cur_params = state_dict_to_params_list(self.net.state_dict())
+                examples = len(self.testloader.dataset)
+            except Exception:
+                cur_params = []
+                examples = 0
+            return float(1.0), examples, {"accuracy": 0.0, "auc": 0.0}
 # Helper to start the client
 # -------------------------
-def client_fn(cid: str, csv_path="client8.csv"):
+def client_fn(cid: str, csv_path="client2.csv"):
     return FlowerADMMClient(client_csv_path=csv_path).to_client()
 
 if __name__ == "__main__":
     # Example CLI usage for a single client process:
-    # python admm_flower_client.py client8.csv
+    # python admm_flower_client.py client2.csv
     import sys
     from flwr.client import start_client
 
-    client_csv = "client8.csv" if len(sys.argv) < 2 else sys.argv[1]
+    client_csv = "client2.csv" if len(sys.argv) < 2 else sys.argv[1]
     client = FlowerADMMClient(client_csv_path=client_csv)
     start_client(server_address="127.0.0.1:5006", client=client.to_client())

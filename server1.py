@@ -127,7 +127,7 @@ def ndarrays_to_parameters(ndarrays):
 # ADMM Strategy (merged, minimal changes)
 # ---------------------------
 class ADMMStrategy(FedAvg):
-    def __init__(self, num_groups=4, alpha=0.3, sigma1=1.0, sigma2=1.0, rho=1.0, local_epochs=1, lr=1e-4, batch_size=64, min_available_clients=3, **kwargs):
+    def __init__(self, num_groups=4, alpha=0.3, sigma1=1.0, sigma2=1.0, rho=1.0, local_epochs=1, lr=1e-4, batch_size=64, min_available_clients=10, **kwargs):
         super().__init__(min_available_clients=min_available_clients, **kwargs)
         self.num_groups = num_groups
         self.alpha = float(alpha)
@@ -626,7 +626,7 @@ if __name__ == "__main__":
         local_epochs=1,
         lr=1e-4,
         batch_size=64,
-        min_available_clients=3,
+        min_available_clients=10,
         evaluate_fn=evaluate,
         evaluate_metrics_aggregation_fn=weighted_average,
     )
