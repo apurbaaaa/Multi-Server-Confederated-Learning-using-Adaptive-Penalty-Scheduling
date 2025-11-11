@@ -160,7 +160,8 @@ class ADMMStrategy(FedAvg):
 
         # Adaptive penalty parameters (Boyd et al. style)
         self.tau = 2.0
-        self.eta = 10.0
+        # Make heuristic more sensitive so adaptation actually triggers in practice
+        self.eta = 2.0
         # small epsilon for numeric stability in denominators
         self._eps = 1e-12
         # residual history persistence
@@ -583,16 +584,51 @@ class ADMMStrategy(FedAvg):
 
             # Adaptive rule parameters (tunable) stored on the strategy
             # Update rules: scale both sigmas together using self.tau/self.eta
+            sigma1_old = float(self.sigma1)
+            sigma2_old = float(self.sigma2)
+            action = "none"
+            scaled = False
+
             if r_norm > (self.eta * s_norm) and r_norm > 0:
-                self.sigma1 *= self.tau
-                self.sigma2 *= self.tau
+                self.sigma1 = self.sigma1 * self.tau
+                self.sigma2 = self.sigma2 * self.tau
                 action = "increase"
+                scaled = True
             elif s_norm > (self.eta * r_norm) and s_norm > 0:
-                self.sigma1 /= self.tau
-                self.sigma2 /= self.tau
+                self.sigma1 = self.sigma1 / self.tau
+                self.sigma2 = self.sigma2 / self.tau
                 action = "decrease"
+                scaled = True
             else:
                 action = "none"
+
+            # If we changed sigma(s), rescale lambda_client_flat and beta_edges to preserve scaled-dual consistency:
+            if scaled:
+                # Avoid division by zero
+                if sigma1_old == 0:
+                    factor1 = 1.0
+                else:
+                    factor1 = float(self.sigma1) / float(sigma1_old)
+                if sigma2_old == 0:
+                    factor2 = 1.0
+                else:
+                    factor2 = float(self.sigma2) / float(sigma2_old)
+
+                # Rescale client lambdas
+                for cid in list(self.lambda_client_flat.keys()):
+                    try:
+                        self.lambda_client_flat[cid] = (self.lambda_client_flat[cid].astype(np.float32) * factor1).astype(np.float32)
+                    except Exception:
+                        logger.exception("Failed to rescale lambda for client %s", cid)
+
+                # Rescale betas for inter-group edges
+                for edge in list(self.beta_edges.keys()):
+                    try:
+                        self.beta_edges[edge] = (self.beta_edges[edge].astype(np.float32) * factor2).astype(np.float32)
+                    except Exception:
+                        logger.exception("Failed to rescale beta for edge %s", edge)
+
+                logger.info("Adaptive penalty scaled: action=%s factor_sigma1=%.6e factor_sigma2=%.6e", action, factor1, factor2)
 
             # Log and record history
             logger.info(
@@ -643,8 +679,6 @@ if __name__ == "__main__":
     )
 
     # ---- ADD THIS AFTER THE SERVER RETURNS ----
-    import csv
-
     try:
         with open("residual_history.csv", "w", newline="") as f:
             writer = csv.writer(f)
