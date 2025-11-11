@@ -13,7 +13,7 @@ import logging
 import torch
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 import traceback
 import json
 import hashlib
@@ -81,12 +81,15 @@ def evaluate(server_round, parameters, config):
 def weighted_average(metrics: List[Tuple[int, dict]]) -> dict:
     accs = [num_examples * m["accuracy"] for num_examples, m in metrics if "accuracy" in m]
     aucs = [num_examples * m["auc"] for num_examples, m in metrics if "auc" in m]
+    f1s = [num_examples * m["f1"] for num_examples, m in metrics if "f1" in m]
     examples = [num_examples for num_examples, _ in metrics]
     results = {}
     if accs:
         results["accuracy"] = sum(accs) / sum(examples)
     if aucs:
         results["auc"] = sum(aucs) / sum(examples)
+    if f1s:
+        results["f1"] = sum(f1s) / sum(examples)
     return results
 
 # ---------------------------

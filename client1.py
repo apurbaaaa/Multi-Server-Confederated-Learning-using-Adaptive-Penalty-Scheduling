@@ -12,19 +12,17 @@ from flwr.client import NumPyClient, ClientApp
 import traceback
 import sys
 import json
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 
 # -------------------------
 # Data loader (per-client)
 # -------------------------
 def load_data(client_file="client1.csv", test_split_ratio=0.5):
-    # Read robustly and handle malformed lines
     try:
         df = pd.read_csv(client_file, engine="python", on_bad_lines="skip")
     except TypeError:
-        # older pandas versions
         df = pd.read_csv(client_file, engine="python")
 
-    # detect label column name flexibly
     if "isFraud" in df.columns:
         label_col = "isFraud"
     elif "Default" in df.columns:
@@ -32,16 +30,13 @@ def load_data(client_file="client1.csv", test_split_ratio=0.5):
     else:
         raise ValueError(f"Label column not found in {client_file}; expected 'isFraud' or 'Default'")
 
-    # drop rows without label, fill remaining NaNs with column means for numeric cols
     df = df.dropna(subset=[label_col])
     df[df.select_dtypes(include=[np.number]).columns] = df.select_dtypes(include=[np.number]).fillna(df.select_dtypes(include=[np.number]).mean())
 
     y = df[label_col].astype(int).values
     X = df.drop(columns=[label_col])
 
-    # Use stratified shuffle split for robustness
     from sklearn.model_selection import train_test_split
-
     stratify = y if len(np.unique(y)) > 1 else None
     X_train, X_test, y_train, y_test = train_test_split(
         X.values.astype("float32"), y.astype("float32"), test_size=test_split_ratio, random_state=42, stratify=stratify
@@ -106,7 +101,6 @@ def flatten_params_list(params_list):
         return np.array([], dtype=np.float32)
     arrs = []
     for p in params_list:
-        # accept lists (from JSON) or numpy arrays
         a = np.asarray(p, dtype=np.float32)
         arrs.append(a.ravel())
     if len(arrs) == 0:
@@ -169,6 +163,7 @@ def test_model(model, testloader, device="cpu"):
     total_loss = 0.0
     total_acc = 0.0
     total_auc = 0.0
+    total_f1 = 0.0
     total_samples = 0
 
     with torch.no_grad():
@@ -187,23 +182,31 @@ def test_model(model, testloader, device="cpu"):
             except Exception:
                 acc = 0.0
             try:
-                # AUC requires both classes present
                 if len(np.unique(y_true)) == 2:
                     auc = roc_auc_score(y_true, probs)
                 else:
                     auc = 0.0
             except Exception:
                 auc = 0.0
+            try:
+                # use binary if binary labels, else macro
+                if len(np.unique(y_true)) == 2:
+                    f1 = f1_score(y_true, preds, average="binary", zero_division=0)
+                else:
+                    f1 = f1_score(y_true, preds, average="macro", zero_division=0)
+            except Exception:
+                f1 = 0.0
 
             n = labels.size(0)
             total_loss += loss * n
             total_acc += acc * n
             total_auc += auc * n
+            total_f1 += f1 * n
             total_samples += n
 
     if total_samples == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / total_samples, total_acc / total_samples, total_auc / total_samples
+        return 0.0, 0.0, 0.0, 0.0
+    return total_loss / total_samples, total_acc / total_samples, total_auc / total_samples, total_f1 / total_samples
 
 # -------------------------
 # Flower client
@@ -243,8 +246,6 @@ class FlowerADMMClient(NumPyClient):
             lr = float(config.get("lr", 1e-4))
             batch_size = int(config.get("batch_size", 64))
 
-            # y is sent as the FitIns.parameters (and already loaded via set_parameters above).
-            # lambda may be provided in the config as a JSON string (to avoid nested lists in the transport).
             lambda_raw = config.get("lambda", None)
             lambda_list = None
             if isinstance(lambda_raw, str) and lambda_raw:
@@ -260,11 +261,9 @@ class FlowerADMMClient(NumPyClient):
                 print("[Client] Warning: 'lambda' not found in config. Running plain local training.", file=sys.stderr)
                 train_with_proximal(self.net, self.trainloader, prox_target_flat=np.zeros(0), sigma1=0.0, epochs=local_epochs, lr=lr, device=self.device)
             else:
-                # derive y_flat from the current model parameters (we already loaded server-sent y into the model)
                 try:
                     y_flat = flatten_state_dict_parameters(self.net).cpu().numpy().astype(np.float32)
                 except Exception:
-                    # fallback: try to flatten parameters from config if present (older behavior)
                     y_list = config.get("y", None)
                     y_flat = flatten_params_list(y_list)
 
@@ -308,9 +307,9 @@ class FlowerADMMClient(NumPyClient):
                 except Exception as e:
                     print("[Client] Warning: eval cannot set params:", e, file=sys.stderr)
 
-            loss, acc, auc = test_model(self.net, self.testloader, device=self.device)
-            print(f"[Client Eval] Loss: {loss:.6f}, Acc: {acc:.4f}, AUC: {auc:.4f}")
-            return float(loss), len(self.testloader.dataset), {"accuracy": float(acc), "auc": float(auc)}
+            loss, acc, auc, f1 = test_model(self.net, self.testloader, device=self.device)
+            print(f"[Client Eval] Loss: {loss:.6f}, Acc: {acc:.4f}, AUC: {auc:.4f}, F1: {f1:.4f}")
+            return float(loss), len(self.testloader.dataset), {"accuracy": float(acc), "auc": float(auc), "f1": float(f1)}
         except Exception:
             print("[Client ERROR] exception during evaluate:", file=sys.stderr)
             traceback.print_exc()
@@ -321,7 +320,7 @@ class FlowerADMMClient(NumPyClient):
             except Exception:
                 cur_params = []
                 examples = 0
-            return float(1.0), examples, {"accuracy": 0.0, "auc": 0.0}
+            return float(1.0), examples, {"accuracy": 0.0, "auc": 0.0, "f1": 0.0}
 # Helper to start the client
 # -------------------------
 def client_fn(cid: str, csv_path="client1.csv"):

@@ -12,11 +12,12 @@ from flwr.client import NumPyClient, ClientApp
 import traceback
 import sys
 import json
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 
 # -------------------------
 # Data loader (per-client)
 # -------------------------
-def load_data(client_file="client2.csv", test_split_ratio=0.5):
+def load_data(client_file="client8.csv", test_split_ratio=0.5):
     try:
         df = pd.read_csv(client_file, engine="python", on_bad_lines="skip")
     except TypeError:
@@ -162,6 +163,7 @@ def test_model(model, testloader, device="cpu"):
     total_loss = 0.0
     total_acc = 0.0
     total_auc = 0.0
+    total_f1 = 0.0
     total_samples = 0
 
     with torch.no_grad():
@@ -186,16 +188,25 @@ def test_model(model, testloader, device="cpu"):
                     auc = 0.0
             except Exception:
                 auc = 0.0
+            try:
+                # use binary if binary labels, else macro
+                if len(np.unique(y_true)) == 2:
+                    f1 = f1_score(y_true, preds, average="binary", zero_division=0)
+                else:
+                    f1 = f1_score(y_true, preds, average="macro", zero_division=0)
+            except Exception:
+                f1 = 0.0
 
             n = labels.size(0)
             total_loss += loss * n
             total_acc += acc * n
             total_auc += auc * n
+            total_f1 += f1 * n
             total_samples += n
 
     if total_samples == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / total_samples, total_acc / total_samples, total_auc / total_samples
+        return 0.0, 0.0, 0.0, 0.0
+    return total_loss / total_samples, total_acc / total_samples, total_auc / total_samples, total_f1 / total_samples
 
 # -------------------------
 # Flower client
@@ -296,9 +307,9 @@ class FlowerADMMClient(NumPyClient):
                 except Exception as e:
                     print("[Client] Warning: eval cannot set params:", e, file=sys.stderr)
 
-            loss, acc, auc = test_model(self.net, self.testloader, device=self.device)
-            print(f"[Client Eval] Loss: {loss:.6f}, Acc: {acc:.4f}, AUC: {auc:.4f}")
-            return float(loss), len(self.testloader.dataset), {"accuracy": float(acc), "auc": float(auc)}
+            loss, acc, auc, f1 = test_model(self.net, self.testloader, device=self.device)
+            print(f"[Client Eval] Loss: {loss:.6f}, Acc: {acc:.4f}, AUC: {auc:.4f}, F1: {f1:.4f}")
+            return float(loss), len(self.testloader.dataset), {"accuracy": float(acc), "auc": float(auc), "f1": float(f1)}
         except Exception:
             print("[Client ERROR] exception during evaluate:", file=sys.stderr)
             traceback.print_exc()
@@ -309,18 +320,18 @@ class FlowerADMMClient(NumPyClient):
             except Exception:
                 cur_params = []
                 examples = 0
-            return float(1.0), examples, {"accuracy": 0.0, "auc": 0.0}
+            return float(1.0), examples, {"accuracy": 0.0, "auc": 0.0, "f1": 0.0}
 # Helper to start the client
 # -------------------------
-def client_fn(cid: str, csv_path="client2.csv"):
+def client_fn(cid: str, csv_path="client8.csv"):
     return FlowerADMMClient(client_csv_path=csv_path).to_client()
 
 if __name__ == "__main__":
     # Example CLI usage for a single client process:
-    # python admm_flower_client.py client2.csv
+    # python admm_flower_client.py client8.csv
     import sys
     from flwr.client import start_client
 
-    client_csv = "client2.csv" if len(sys.argv) < 2 else sys.argv[1]
+    client_csv = "client8.csv" if len(sys.argv) < 2 else sys.argv[1]
     client = FlowerADMMClient(client_csv_path=client_csv)
     start_client(server_address="127.0.0.1:5006", client=client.to_client())
