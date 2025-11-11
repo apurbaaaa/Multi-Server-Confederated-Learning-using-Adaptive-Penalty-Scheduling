@@ -16,6 +16,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, roc_auc_score
 import traceback
 import json
+import hashlib
+import os
+import csv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -152,6 +155,15 @@ class ADMMStrategy(FedAvg):
             if g + 1 < num_groups:
                 self.neighbors[g].append(g + 1)
 
+        # Adaptive penalty parameters (Boyd et al. style)
+        self.tau = 2.0
+        self.eta = 10.0
+        # small epsilon for numeric stability in denominators
+        self._eps = 1e-12
+        # residual history persistence
+        self._residual_csv_path = "residual_history.csv"
+        self._residual_csv_initialized = os.path.exists(self._residual_csv_path)
+
     def _lazy_init(self, client_manager: ClientManager, parameters: Parameters):
         """
         Backwards/forwards compatible initialization of ADMM state.
@@ -241,9 +253,15 @@ class ADMMStrategy(FedAvg):
                 if p < q:
                     self.beta_edges[(p, q)] = np.zeros_like(flat0, dtype=np.float32)
 
+        # mark initialized
         self._initialized = True
         logger.info("ADMM state initialized: param vector length %d", flat0.size)
 
+        # --- NEW: residual tracking and previous y storage for adaptive penalty ---
+        # Keep previous y per group for dual residual computation
+        self.y_group_flat_prev = {g: self.y_group_flat[g].copy() for g in range(self.num_groups)}
+        # History list: tuples (round, r_norm, s_norm, sigma1, sigma2)
+        self.residual_history = []
 
     # Replace your existing configure_fit signature with this function
     def configure_fit(self, *args, **kwargs):
@@ -354,6 +372,7 @@ class ADMMStrategy(FedAvg):
 
             config = {
                 "sigma1": str(self.sigma1),
+                "sigma2": str(self.sigma2),         # <-- added
                 "local_epochs": str(self.local_epochs),
                 "lr": str(self.lr),
                 "batch_size": str(self.batch_size),
@@ -369,7 +388,7 @@ class ADMMStrategy(FedAvg):
 
 
     def aggregate_fit(self, rnd, results, failures):
-        # Diagnostic logging: number of successful results and failures
+    # Diagnostic logging: number of successful results and failures
         try:
             num_results = len(results) if results is not None else 0
         except Exception:
@@ -385,18 +404,15 @@ class ADMMStrategy(FedAvg):
         if failures:
             try:
                 for f in failures:
-                    # Flower may provide either (client_proxy, exception) tuples OR raw exceptions
                     if isinstance(f, (list, tuple)) and len(f) == 2:
                         cp, exc = f
                         cid_f = getattr(cp, "cid", str(cp))
                         logger.error("Fit failure from client %s: %s", cid_f, repr(exc))
-                        # If exc is an exception instance, include its traceback if possible
                         try:
                             logger.error("Traceback for failure from client %s:\n%s", cid_f, ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
                         except Exception:
                             logger.debug("Could not format traceback for failure from client %s", cid_f)
                     else:
-                        # raw exception object or other payload
                         logger.error("Fit failure entry (raw): %s", repr(f))
                         try:
                             if isinstance(f, BaseException):
@@ -417,6 +433,7 @@ class ADMMStrategy(FedAvg):
         except Exception:
             logger.exception("Unable to compute params_template flat length")
 
+        # Process results: store client flattened parameters
         for client_proxy, fit_res in results:
             # Robust extraction of client id
             try:
@@ -429,12 +446,10 @@ class ADMMStrategy(FedAvg):
 
             # If a new client connected after _lazy_init, assign it to a group and initialize its ADMM state
             if cid not in self.client_to_group:
-                # simple round-robin assignment based on current count
                 new_idx = len(self.client_to_group)
                 g = new_idx % self.num_groups
                 self.client_to_group[cid] = g
                 self.group_to_clients[g].append(cid)
-                # initialize x and lambda for the new client using template
                 try:
                     template_flat = params_list_to_flat(self.params_template) if self.params_template is not None else np.array([], dtype=np.float32)
                 except Exception:
@@ -451,7 +466,6 @@ class ADMMStrategy(FedAvg):
                 logger.info("Received fit result from client %s: %d param arrays, shapes=%s, flat_len=%d", cid, len(client_params_list), shapes, flat_len)
             except Exception as ex:
                 logger.exception("Failed to parse parameters from client %s: %s", cid, ex)
-                # fallback to raw parameters
                 try:
                     client_params_list = fit_res.parameters
                     logger.info("Fallback: stored raw parameters type for client %s: %s", cid, type(client_params_list))
@@ -464,17 +478,24 @@ class ADMMStrategy(FedAvg):
                 self.x_client[cid] = flat.copy()
             except Exception:
                 logger.exception("Failed to flatten/store parameters for client %s", cid)
+
+        # Group sums and counts
         group_x_sum = {}
         group_counts = {}
         for g in range(self.num_groups):
             cids = self.group_to_clients.get(g, [])
             if len(cids) == 0:
-                group_x_sum[g] = np.zeros_like(next(iter(self.y_group_flat.values())))
+                # safe fallback: zero vector with same shape as any y
+                if len(self.y_group_flat) > 0:
+                    group_x_sum[g] = np.zeros_like(next(iter(self.y_group_flat.values())))
+                else:
+                    group_x_sum[g] = np.array([], dtype=np.float32)
                 group_counts[g] = 0
             else:
                 xs = [self.x_client[cid] for cid in cids]
                 group_x_sum[g] = np.sum(xs, axis=0)
                 group_counts[g] = len(cids)
+
         def compute_A_T_beta_for_group(g):
             total = np.zeros_like(next(iter(self.y_group_flat.values())))
             for (p, q), beta in self.beta_edges.items():
@@ -483,6 +504,8 @@ class ADMMStrategy(FedAvg):
                 elif g == q:
                     total = total - beta
             return total
+
+        # y update (group-level)
         for g in range(self.num_groups):
             num_clients = group_counts.get(g, 0)
             if num_clients == 0:
@@ -498,21 +521,97 @@ class ADMMStrategy(FedAvg):
                 continue
             y_new = numerator / float(denom)
             self.y_group_flat[g] = y_new.astype(np.float32)
+
+        # beta (edge) updates
         for (p, q), beta in list(self.beta_edges.items()):
             y_p = self.y_group_flat[p]
             y_q = self.y_group_flat[q]
             self.beta_edges[(p, q)] = beta + self.sigma2 * (y_p - y_q)
+
+        # lambda (client) updates (two-step with over-relaxation)
         for cid, x_flat in self.x_client.items():
             g = self.client_to_group[cid]
             y_g = self.y_group_flat[g]
             lam = self.lambda_client_flat[cid]
             lam_bar = lam + self.sigma1 * (x_flat - y_g)
             self.lambda_client_flat[cid] = lam + self.alpha * (lam_bar - lam)
+
+        # --- Adaptive penalty scheduling using primal and dual residuals ---
+        try:
+            # Ensure prev storage exists
+            if not hasattr(self, "y_group_flat_prev"):
+                self.y_group_flat_prev = {g: self.y_group_flat[g].copy() for g in range(self.num_groups)}
+            if not hasattr(self, "residual_history"):
+                self.residual_history = []
+
+            # primal residual r = stacked (x_client[cid] - y_group_flat[group])
+            r_list = []
+            for cid, x_flat in self.x_client.items():
+                g = self.client_to_group.get(cid, 0)
+                y_g = self.y_group_flat[g]
+                # if shapes mismatch, try to align by trimming/padding (robustness)
+                if x_flat.size == y_g.size:
+                    r_list.append((x_flat - y_g))
+                else:
+                    # fallback: compute norm of difference on min length
+                    min_len = min(x_flat.size, y_g.size)
+                    r_list.append((x_flat[:min_len] - y_g[:min_len]))
+            if len(r_list) == 0:
+                r_norm = 0.0
+            else:
+                r_concat = np.concatenate([r.astype(np.float32) for r in r_list])
+                r_norm = float(np.linalg.norm(r_concat))
+
+            # dual residual s = sigma1 * stacked(y_group_flat[g] - y_group_flat_prev[g])
+            s_list = []
+            for g in range(self.num_groups):
+                y_curr = self.y_group_flat[g]
+                y_prev = self.y_group_flat_prev.get(g, np.zeros_like(y_curr))
+                if y_curr.size == y_prev.size:
+                    s_list.append((y_curr - y_prev))
+                else:
+                    min_len = min(y_curr.size, y_prev.size)
+                    s_list.append((y_curr[:min_len] - y_prev[:min_len]))
+            if len(s_list) == 0:
+                s_norm = 0.0
+            else:
+                s_concat = np.concatenate([s.astype(np.float32) for s in s_list])
+                s_norm = float(self.sigma1 * np.linalg.norm(s_concat))
+
+            # Adaptive rule parameters (tunable) stored on the strategy
+            # Update rules: scale both sigmas together using self.tau/self.eta
+            if r_norm > (self.eta * s_norm) and r_norm > 0:
+                self.sigma1 *= self.tau
+                self.sigma2 *= self.tau
+                action = "increase"
+            elif s_norm > (self.eta * r_norm) and s_norm > 0:
+                self.sigma1 /= self.tau
+                self.sigma2 /= self.tau
+                action = "decrease"
+            else:
+                action = "none"
+
+            # Log and record history
+            logger.info(
+                "[ADMM adaptive] round=%d r_norm=%.6e s_norm=%.6e action=%s sigma1=%.6e sigma2=%.6e",
+                rnd, r_norm, s_norm, action, self.sigma1, self.sigma2
+            )
+            self.residual_history.append((int(rnd), float(r_norm), float(s_norm), float(self.sigma1), float(self.sigma2)))
+
+            # update prev y for next round
+            for g in range(self.num_groups):
+                self.y_group_flat_prev[g] = self.y_group_flat[g].copy()
+
+        except Exception:
+            logger.exception("Error computing adaptive penalties in aggregate_fit")
+
+        # publish averaged y as server model parameters
         all_y = np.stack([self.y_group_flat[g] for g in range(self.num_groups)], axis=0)
         y_avg = np.mean(all_y, axis=0)
         params_list = flat_to_params_list(y_avg, self.params_template)
         parameters = ndarrays_to_parameters(params_list)
         return parameters, {}
+
 
 # ---------------------------
 # Run server
@@ -539,3 +638,15 @@ if __name__ == "__main__":
         config=config,
         strategy=strategy,
     )
+
+    # ---- ADD THIS AFTER THE SERVER RETURNS ----
+    import csv
+
+    try:
+        with open("residual_history.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["round", "r_norm", "s_norm", "sigma1", "sigma2"])
+            writer.writerows(strategy.residual_history)
+        print("Residual history saved to residual_history.csv")
+    except Exception as e:
+        print(f"Could not save residual history: {e}")
